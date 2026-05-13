@@ -1,0 +1,114 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF to Study Card Converter</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        darkMode: 'class',
+      }
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .font-jp { font-family: 'Noto Sans JP', sans-serif; }
+        
+        /* Scrollbar Styling for Sidebar */
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 6px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background-color: #cbd5e1;
+            border-radius: 20px;
+        }
+
+        /* Furigana Styling */
+        ruby {
+            ruby-align: space-around;
+            ruby-position: over;
+        }
+        rt {
+            font-family: 'Noto Sans JP', sans-serif;
+            font-size: 0.6em;
+            color: #4b5563;
+            line-height: 1.2;
+            font-weight: 500;
+            user-select: none;
+            transition: opacity 0.2s;
+        }
+        
+        /* Utility to hide Furigana */
+        .hide-furigana rt {
+            display: none !important;
+        }
+
+        /* Print / PDF Export Styles */
+        @media print {
+            @page { margin: 10mm; size: A4; }
+            
+            /* Reset all heights and overflows to allow full content printing */
+            html, body, #root, #app-container, main {
+                height: auto !important;
+                min-height: auto !important;
+                overflow: visible !important;
+                position: static !important;
+                width: 100% !important;
+                display: block !important;
+            }
+
+            /* Hide Sidebar and Header */
+            #sidebar, header, .no-print {
+                display: none !important;
+            }
+
+            /* Target the specific scrollable container in App.tsx */
+            #printable-content {
+                height: auto !important;
+                overflow: visible !important;
+                padding: 0 !important;
+                margin: 0 !important;
+                display: block !important;
+            }
+
+            /* Ensure cards break nicely */
+            .study-card {
+                break-inside: avoid;
+                page-break-inside: avoid;
+                border: 1px solid #ddd !important;
+                box-shadow: none !important;
+                margin-bottom: 20px !important;
+                background-color: white !important;
+            }
+
+            /* Hide background colors for cleaner print unless user enforces it */
+            body {
+                background-color: white !important;
+            }
+        }
+    </style>
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@^19.2.3",
+    "react-dom/": "https://esm.sh/react-dom@^19.2.3/",
+    "react/": "https://esm.sh/react@^19.2.3/",
+    "@google/genai": "https://esm.sh/@google/genai@^1.37.0"
+  }
+}
+</script>
+<link rel="stylesheet" href="/index.css">
+</head>
+<body class="bg-gray-50 text-gray-900 overflow-x-hidden">
+    <div id="root"></div>
+<script type="module" src="/index.tsx"></script>
+</body>
+</html>

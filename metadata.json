@@ -1,0 +1,7 @@
+{
+  "name": "PDF to Exam Card Converter",
+  "description": "A tool for architects and engineers to convert Japanese exam PDFs into structured study cards with Burmese translations and Furigana support.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
