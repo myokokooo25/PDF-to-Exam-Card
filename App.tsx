@@ -2,12 +2,38 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { processPageImages, processGeneralTranslation, extractVocabulary } from './geminiService';
 import { StudyCardData, AppStatus, HistorySession, AppMode, TranslationItem, VocabItem } from './types';
+import { auth, db, googleProvider, signInWithPopup, signOut } from './firebase';
+import { onAuthStateChanged, User } from 'firebase/auth';
+import { collection, query, where, getDocs, doc, setDoc, deleteDoc, updateDoc } from 'firebase/firestore';
 
 // PDF.js worker setup
 // @ts-ignore
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
+interface ChunkProgressState {
+  isActive: boolean;
+  file: File | null;
+  fileName: string;
+  mode: AppMode;
+  totalPageCount: number;
+  pageSize: number;
+  chunks: {
+    id: number;
+    startPage: number;
+    endPage: number;
+    status: 'idle' | 'processing' | 'success' | 'failed';
+    error?: string;
+    data?: any[];
+  }[];
+  currentChunkIndex: number;
+  accumulatedCards: StudyCardData[];
+  accumulatedTranslations: TranslationItem[];
+  isAutoProcessing: boolean;
+}
+
 const App: React.FC = () => {
+  const [user, setUser] = useState<User | null>(null);
+  const [isAuthLoading, setIsAuthLoading] = useState<boolean>(true);
   const [status, setStatus] = useState<AppStatus>(AppStatus.IDLE);
   const [data, setData] = useState<StudyCardData[]>([]);
   const [translationData, setTranslationData] = useState<TranslationItem[]>([]);
@@ -29,23 +55,95 @@ const App: React.FC = () => {
   const [userAnswers, setUserAnswers] = useState<Record<string, string>>({});
   const [activeTab, setActiveTab] = useState<'preview' | 'code' | 'vocab'>('preview');
   
+  const [chunkState, setChunkState] = useState<ChunkProgressState>({
+    isActive: false,
+    file: null,
+    fileName: "",
+    mode: AppMode.STUDY_CARDS,
+    totalPageCount: 0,
+    pageSize: 2,
+    chunks: [],
+    currentChunkIndex: 0,
+    accumulatedCards: [],
+    accumulatedTranslations: [],
+    isAutoProcessing: false
+  });
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const translationFileInputRef = useRef<HTMLInputElement>(null);
 
-  // Load history from local storage on mount
+  // Listen to authenticating status changes and load history dynamically
   useEffect(() => {
-    const savedHistory = localStorage.getItem('examCardHistory');
-    if (savedHistory) {
-      try {
-        const parsed = JSON.parse(savedHistory);
-        setHistory(parsed);
-      } catch (e) {
-        console.error("Failed to load history", e);
+    const unsubscribe = onAuthStateChanged(auth, async (u) => {
+      setUser(u);
+      setIsAuthLoading(false);
+      
+      if (u) {
+        try {
+          const q = query(
+            collection(db, "sessions"),
+            where("userId", "==", u.uid)
+          );
+          const querySnapshot = await getDocs(q);
+          const fetchedSessions: HistorySession[] = [];
+          querySnapshot.forEach((docSnapshot) => {
+            const data = docSnapshot.data();
+            fetchedSessions.push({
+              id: docSnapshot.id,
+              fileName: data.fileName,
+              timestamp: data.timestamp,
+              data: data.data || [],
+              mode: data.mode,
+              translationData: data.translationData || [],
+              vocabData: data.vocabData || []
+            });
+          });
+          fetchedSessions.sort((a, b) => b.timestamp - a.timestamp);
+          setHistory(fetchedSessions);
+        } catch (err) {
+          console.error("Error loading history from Firestore:", err);
+        }
+      } else {
+        const savedHistory = localStorage.getItem('examCardHistory');
+        if (savedHistory) {
+          try {
+            setHistory(JSON.parse(savedHistory));
+          } catch (e) {
+            console.error("Failed to load history", e);
+          }
+        } else {
+          setHistory([]);
+        }
       }
-    }
+    });
+
     const savedTheme = localStorage.getItem('theme');
     if (savedTheme === 'dark') setIsDarkMode(true);
+
+    return () => unsubscribe();
   }, []);
+
+  const handleLogin = async () => {
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (err: any) {
+      console.error("Sign-in failed:", err);
+      alert("Sign-in failed: " + err.message);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      setData([]);
+      setTranslationData([]);
+      setVocabData([]);
+      setStatus(AppStatus.IDLE);
+      setActiveSessionId(null);
+    } catch (err: any) {
+      console.error("Sign-out failed:", err);
+    }
+  };
 
   useEffect(() => {
     if (isDarkMode) {
@@ -57,9 +155,10 @@ const App: React.FC = () => {
     }
   }, [isDarkMode]);
 
-  const saveToHistory = (fileName: string, cards: StudyCardData[], mode: AppMode = AppMode.STUDY_CARDS, transData?: TranslationItem[], vocab?: VocabItem[]) => {
+  const saveToHistory = async (fileName: string, cards: StudyCardData[], mode: AppMode = AppMode.STUDY_CARDS, transData?: TranslationItem[], vocab?: VocabItem[]) => {
+    const sessionId = Date.now().toString();
     const newSession: HistorySession = {
-      id: Date.now().toString(),
+      id: sessionId,
       fileName: fileName,
       timestamp: Date.now(),
       data: cards,
@@ -70,8 +169,20 @@ const App: React.FC = () => {
     
     const updatedHistory = [newSession, ...history];
     setHistory(updatedHistory);
-    localStorage.setItem('examCardHistory', JSON.stringify(updatedHistory));
     setActiveSessionId(newSession.id);
+
+    if (user) {
+      try {
+        await setDoc(doc(db, "sessions", sessionId), {
+          ...newSession,
+          userId: user.uid
+        });
+      } catch (err) {
+        console.error("Error saving to Firestore:", err);
+      }
+    } else {
+      localStorage.setItem('examCardHistory', JSON.stringify(updatedHistory));
+    }
   };
 
   const loadSession = (session: HistorySession) => {
@@ -94,11 +205,10 @@ const App: React.FC = () => {
     if (window.innerWidth < 768) setIsSidebarOpen(false); // Close sidebar on mobile after selection
   };
 
-  const deleteSession = (e: React.MouseEvent, id: string) => {
+  const deleteSession = async (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
     const updatedHistory = history.filter(h => h.id !== id);
     setHistory(updatedHistory);
-    localStorage.setItem('examCardHistory', JSON.stringify(updatedHistory));
     
     if (activeSessionId === id) {
       setData([]);
@@ -107,7 +217,224 @@ const App: React.FC = () => {
       setStatus(AppStatus.IDLE);
       setActiveSessionId(null);
     }
+
+    if (user) {
+      try {
+        await deleteDoc(doc(db, "sessions", id));
+      } catch (err) {
+        console.error("Error deleting from Firestore:", err);
+      }
+    } else {
+      localStorage.setItem('examCardHistory', JSON.stringify(updatedHistory));
+    }
   };
+
+  const generateChunks = (totalPages: number, size: number) => {
+    const list = [];
+    let id = 1;
+    for (let i = 1; i <= totalPages; i += size) {
+      const endPage = Math.min(i + size - 1, totalPages);
+      list.push({
+        id,
+        startPage: i,
+        endPage,
+        status: 'idle' as const,
+        error: undefined,
+        data: undefined,
+      });
+      id++;
+    }
+    return list;
+  };
+
+  const convertPdfPagesToImages = async (file: File, startPage: number, endPage: number): Promise<string[]> => {
+    const arrayBuffer = await file.arrayBuffer();
+    // @ts-ignore
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    const images: string[] = [];
+
+    for (let i = startPage; i <= endPage; i++) {
+      setProgress(`Part Pages ${startPage}-${endPage}: Converting Page ${i}...`);
+      const page = await pdf.getPage(i);
+      const viewport = page.getViewport({ scale: 2.5 });
+      const canvas = document.createElement('canvas');
+      const context = canvas.getContext('2d');
+      if (!context) continue;
+
+      canvas.height = viewport.height;
+      canvas.width = viewport.width;
+
+      await page.render({ canvasContext: context, viewport }).promise;
+      images.push(canvas.toDataURL('image/jpeg', 0.9));
+    }
+    return images;
+  };
+
+  const processChunk = async (chunkIndex: number, currentChunksList?: any[]) => {
+    const list = currentChunksList || chunkState.chunks;
+    const chunk = list[chunkIndex];
+    if (!chunk || !chunkState.file) return;
+
+    setChunkState(prev => {
+      const updated = prev.chunks.map((c, i) => i === chunkIndex ? { ...c, status: 'processing' as const, error: undefined } : c);
+      return { ...prev, chunks: updated, currentChunkIndex: chunkIndex };
+    });
+
+    setStatus(AppStatus.PROCESSING_AI);
+    setProgress(`AI is processing Part ${chunk.id} (Pages ${chunk.startPage}-${chunk.endPage})...`);
+
+    try {
+      const images = await convertPdfPagesToImages(chunkState.file, chunk.startPage, chunk.endPage);
+      
+      let chunkResult: any[] = [];
+      if (chunkState.mode === AppMode.STUDY_CARDS) {
+        chunkResult = await processPageImages(images);
+      } else {
+        chunkResult = await processGeneralTranslation({ images });
+      }
+
+      setChunkState(prev => {
+        const updatedChunks = prev.chunks.map((c, i) => i === chunkIndex ? { 
+          ...c, 
+          status: 'success' as const, 
+          data: chunkResult 
+        } : c);
+
+        let newAccumulatedCards = prev.accumulatedCards;
+        let newAccumulatedTranslations = prev.accumulatedTranslations;
+        
+        if (prev.mode === AppMode.STUDY_CARDS) {
+          const offset = prev.accumulatedCards.length;
+          const adjustedCards = chunkResult.map((card: any, idx: number) => ({
+            ...card,
+            id: (offset + idx + 1).toString()
+          }));
+          newAccumulatedCards = [...prev.accumulatedCards, ...adjustedCards];
+        } else {
+          const offset = prev.accumulatedTranslations.length;
+          const adjustedTrans = chunkResult.map((item: any, idx: number) => ({
+            ...item,
+            id: (offset + idx + 1).toString()
+          }));
+          newAccumulatedTranslations = [...prev.accumulatedTranslations, ...adjustedTrans];
+        }
+
+        return {
+          ...prev,
+          chunks: updatedChunks,
+          accumulatedCards: newAccumulatedCards,
+          accumulatedTranslations: newAccumulatedTranslations,
+          currentChunkIndex: chunkIndex + 1
+        };
+      });
+
+      setStatus(AppStatus.SUCCESS);
+    } catch (err: any) {
+      console.error("Chunk processing failed:", err);
+      const errMsg = err.message || "Unknown error";
+      
+      setChunkState(prev => {
+        const updatedChunks = prev.chunks.map((c, i) => i === chunkIndex ? { 
+          ...c, 
+          status: 'failed' as const, 
+          error: errMsg
+        } : c);
+        return {
+          ...prev,
+          chunks: updatedChunks,
+          isAutoProcessing: false
+        };
+      });
+      setError(`Part ${chunk.id} (Pages ${chunk.startPage}-${chunk.endPage}) failed: ${errMsg}`);
+      setStatus(AppStatus.ERROR);
+    }
+  };
+
+  const handleFinishChunkedProcessing = () => {
+    if (chunkState.accumulatedCards.length === 0 && chunkState.accumulatedTranslations.length === 0) {
+      alert("No data has been completed yet.");
+      return;
+    }
+
+    if (chunkState.mode === AppMode.STUDY_CARDS) {
+      setData(chunkState.accumulatedCards);
+      saveToHistory(chunkState.fileName, chunkState.accumulatedCards, AppMode.STUDY_CARDS);
+      setAppMode(AppMode.STUDY_CARDS);
+    } else {
+      setTranslationData(chunkState.accumulatedTranslations);
+      saveToHistory(chunkState.fileName, [], AppMode.TRANSLATION, chunkState.accumulatedTranslations);
+      setAppMode(AppMode.TRANSLATION);
+    }
+
+    setChunkState(prev => ({ ...prev, isActive: false }));
+    setStatus(AppStatus.SUCCESS);
+    setActiveTab('preview');
+  };
+
+  const handlePageSizeChange = (newSize: number) => {
+    setChunkState(prev => {
+      const generated = generateChunks(prev.totalPageCount, newSize);
+      return {
+        ...prev,
+        pageSize: newSize,
+        chunks: generated,
+        currentChunkIndex: 0
+      };
+    });
+  };
+
+  const handlePdfUploadInit = async (file: File, mode: AppMode) => {
+    try {
+      setError(null);
+      setVocabData([]);
+      setStatus(AppStatus.LOADING_PDF);
+      setProgress("Reading PDF structure...");
+
+      const arrayBuffer = await file.arrayBuffer();
+      // @ts-ignore
+      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      const totalPageCount = pdf.numPages;
+
+      const initialSize = 2; // Default pages per chunk
+      const generated = generateChunks(totalPageCount, initialSize);
+
+      setChunkState({
+        isActive: true,
+        file: file,
+        fileName: file.name,
+        mode: mode,
+        totalPageCount: totalPageCount,
+        pageSize: initialSize,
+        chunks: generated,
+        currentChunkIndex: 0,
+        accumulatedCards: [],
+        accumulatedTranslations: [],
+        isAutoProcessing: false
+      });
+      
+      setStatus(AppStatus.IDLE);
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message || "Failed to load PDF structure.");
+      setStatus(AppStatus.ERROR);
+    }
+  };
+
+  // Auto-advance for chunked processing
+  useEffect(() => {
+    if (chunkState.isAutoProcessing && chunkState.isActive) {
+      const currentlyProcessing = chunkState.chunks.some(c => c.status === 'processing');
+      if (currentlyProcessing) return;
+
+      const nextIndex = chunkState.chunks.findIndex(c => c.status === 'idle' || c.status === 'failed');
+      if (nextIndex !== -1) {
+        processChunk(nextIndex);
+      } else {
+        setChunkState(prev => ({ ...prev, isAutoProcessing: false }));
+        handleFinishChunkedProcessing();
+      }
+    }
+  }, [chunkState.isAutoProcessing, chunkState.isActive, chunkState.chunks]);
 
   const convertPdfToImages = async (file: File): Promise<string[]> => {
     const arrayBuffer = await file.arrayBuffer();
@@ -135,29 +462,8 @@ const App: React.FC = () => {
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
-
-    try {
-      setError(null);
-      setVocabData([]);
-      setStatus(AppStatus.LOADING_PDF);
-      setAppMode(AppMode.STUDY_CARDS);
-      
-      const images = await convertPdfToImages(file);
-      
-      setStatus(AppStatus.PROCESSING_AI);
-      setProgress("AI is analyzing Japanese text & Furigana...");
-      
-      const result = await processPageImages(images);
-      
-      setData(result);
-      saveToHistory(file.name, result, AppMode.STUDY_CARDS);
-      setStatus(AppStatus.SUCCESS);
-      setActiveTab('preview');
-    } catch (err: any) {
-      console.error(err);
-      setError(err.message || "An error occurred during processing.");
-      setStatus(AppStatus.ERROR);
-    }
+    setAppMode(AppMode.STUDY_CARDS);
+    await handlePdfUploadInit(file, AppMode.STUDY_CARDS);
   };
 
   const handleTranslationSubmit = async () => {
@@ -189,27 +495,8 @@ const App: React.FC = () => {
   const handleTranslationFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
-
-    try {
-      setError(null);
-      setVocabData([]);
-      setStatus(AppStatus.LOADING_PDF);
-      
-      const images = await convertPdfToImages(file);
-      
-      setStatus(AppStatus.PROCESSING_AI);
-      setProgress("Translating PDF...");
-      
-      const result = await processGeneralTranslation({ images });
-      
-      setTranslationData(result);
-      saveToHistory(file.name, [], AppMode.TRANSLATION, result);
-      setStatus(AppStatus.SUCCESS);
-    } catch (err: any) {
-      console.error(err);
-      setError(err.message || "An error occurred during translation.");
-      setStatus(AppStatus.ERROR);
-    }
+    setAppMode(AppMode.TRANSLATION);
+    await handlePdfUploadInit(file, AppMode.TRANSLATION);
   };
 
   const handlePrint = () => {
@@ -316,7 +603,18 @@ const App: React.FC = () => {
       // Update history
       const updatedHistory = history.map(h => h.id === activeSessionId ? { ...h, vocabData: vocab } : h);
       setHistory(updatedHistory);
-      localStorage.setItem('examCardHistory', JSON.stringify(updatedHistory));
+      
+      if (user && activeSessionId) {
+        try {
+          await updateDoc(doc(db, "sessions", activeSessionId), {
+            vocabData: vocab
+          });
+        } catch (err) {
+          console.error("Error updating vocab in Firestore:", err);
+        }
+      } else {
+        localStorage.setItem('examCardHistory', JSON.stringify(updatedHistory));
+      }
       setActiveTab('vocab');
     } catch (err: any) {
       console.error(err);
@@ -331,13 +629,24 @@ const App: React.FC = () => {
     setEditForm(JSON.parse(JSON.stringify(card)));
   };
 
-  const saveCardEdit = () => {
+  const saveCardEdit = async () => {
     const updatedData = data.map(c => c.id === editingCardId ? editForm : c);
     setData(updatedData);
     setEditingCardId(null);
     const updatedHistory = history.map(h => h.id === activeSessionId ? { ...h, data: updatedData } : h);
     setHistory(updatedHistory);
-    localStorage.setItem('examCardHistory', JSON.stringify(updatedHistory));
+    
+    if (user && activeSessionId) {
+      try {
+        await updateDoc(doc(db, "sessions", activeSessionId), {
+          data: updatedData
+        });
+      } catch (err) {
+        console.error("Error updating cards in Firestore:", err);
+      }
+    } else {
+      localStorage.setItem('examCardHistory', JSON.stringify(updatedHistory));
+    }
   };
 
   const startEditingTrans = (index: number, item: TranslationItem) => {
@@ -345,7 +654,7 @@ const App: React.FC = () => {
     setEditForm({ ...item });
   };
 
-  const saveTransEdit = () => {
+  const saveTransEdit = async () => {
     const updatedData = [...translationData];
     if (editingTransIndex !== null) {
       updatedData[editingTransIndex] = editForm;
@@ -354,7 +663,18 @@ const App: React.FC = () => {
     setEditingTransIndex(null);
     const updatedHistory = history.map(h => h.id === activeSessionId ? { ...h, translationData: updatedData } : h);
     setHistory(updatedHistory);
-    localStorage.setItem('examCardHistory', JSON.stringify(updatedHistory));
+    
+    if (user && activeSessionId) {
+      try {
+        await updateDoc(doc(db, "sessions", activeSessionId), {
+          translationData: updatedData
+        });
+      } catch (err) {
+        console.error("Error updating translation in Firestore:", err);
+      }
+    } else {
+      localStorage.setItem('examCardHistory', JSON.stringify(updatedHistory));
+    }
   };
 
   const playAudio = (e: React.MouseEvent, htmlContent: string) => {
@@ -383,6 +703,54 @@ const App: React.FC = () => {
           ${isSidebarOpen ? 'w-80 translate-x-0' : 'w-0 -translate-x-full md:w-0 md:-translate-x-0'}
         `}
       >
+        {/* User Auth Profile Widget */}
+        <div className="p-4 border-b border-gray-100 dark:border-gray-700 bg-slate-50/50 dark:bg-gray-800/50 min-w-[20rem]">
+          {isAuthLoading ? (
+            <div className="flex items-center gap-2 py-2 justify-center">
+              <div className="w-4 h-4 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+              <span className="text-xs text-gray-400">Loading session...</span>
+            </div>
+          ) : user ? (
+            <div className="flex items-center justify-between gap-3 bg-white dark:bg-gray-800 p-3 rounded-2xl border border-gray-100 dark:border-gray-700 shadow-sm animate-in fade-in duration-250">
+              <div className="flex items-center gap-2.5 overflow-hidden">
+                <img 
+                  src={user.photoURL || `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(user.displayName || 'User')}`} 
+                  alt="Profile" 
+                  referrerPolicy="no-referrer"
+                  className="w-9 h-9 rounded-full ring-2 ring-indigo-50 dark:ring-indigo-950 object-cover flex-shrink-0"
+                />
+                <div className="overflow-hidden">
+                  <h4 className="text-xs font-bold text-gray-800 dark:text-gray-200 truncate leading-tight">{user.displayName}</h4>
+                  <p className="text-[10px] text-gray-400 dark:text-gray-500 truncate mt-0.5">{user.email}</p>
+                </div>
+              </div>
+              <button 
+                onClick={handleLogout}
+                className="p-1.5 hover:bg-rose-50 dark:hover:bg-rose-950/30 text-gray-400 hover:text-rose-500 rounded-lg transition-colors flex-shrink-0"
+                title="Sign Out"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                </svg>
+              </button>
+            </div>
+          ) : (
+            <div className="bg-white dark:bg-gray-850 p-4 rounded-2xl border border-dashed border-gray-200 dark:border-gray-700 text-center shadow-xs">
+              <h4 className="text-xs font-black text-gray-800 dark:text-gray-200 flex items-center justify-center gap-1.5 uppercase tracking-wider">
+                Cloud Sync 🌐
+              </h4>
+              <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-1 mb-3 leading-relaxed">Sign in with Google to automatically back up your conversions and access them anywhere.</p>
+              <button 
+                onClick={handleLogin}
+                className="w-full inline-flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-3 rounded-xl text-xs shadow-xs transition-all hover:scale-[1.02]"
+              >
+                <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="Google" className="w-3.5 h-3.5 bg-white rounded-full p-0.5" />
+                Sign in with Google
+              </button>
+            </div>
+          )}
+        </div>
+
         <div className="p-5 border-b border-gray-100 dark:border-gray-700 flex justify-between items-center bg-gray-50 dark:bg-gray-800 min-w-[20rem]">
           <h2 className="font-bold text-gray-700 dark:text-gray-200 flex items-center gap-2">
             <svg className="w-5 h-5 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
@@ -526,23 +894,202 @@ const App: React.FC = () => {
           className={`flex-1 overflow-y-auto bg-slate-50 dark:bg-gray-900 p-4 md:p-8 custom-scrollbar ${showFurigana ? '' : 'hide-furigana'}`}
         >
           <div className="max-w-4xl mx-auto">
-            {/* Mobile Tab Selector */}
-            <div className="md:hidden flex bg-gray-100 dark:bg-gray-800 p-1 rounded-lg mb-4">
-              <button 
-                onClick={() => { setAppMode(AppMode.STUDY_CARDS); if(status !== AppStatus.PROCESSING_AI) setStatus(AppStatus.IDLE); }} 
-                className={`flex-1 px-4 py-2 rounded-md text-sm font-medium transition-colors ${appMode === AppMode.STUDY_CARDS ? 'bg-white dark:bg-gray-700 shadow-sm text-indigo-600 dark:text-indigo-400' : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'}`}
-              >
-                Cards
-              </button>
-              <button 
-                onClick={() => { setAppMode(AppMode.TRANSLATION); if(status !== AppStatus.PROCESSING_AI) setStatus(AppStatus.IDLE); }} 
-                className={`flex-1 px-4 py-2 rounded-md text-sm font-medium transition-colors ${appMode === AppMode.TRANSLATION ? 'bg-white dark:bg-gray-700 shadow-sm text-indigo-600 dark:text-indigo-400' : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'}`}
-              >
-                Translate
-              </button>
-            </div>
+            {chunkState.isActive && (
+              <div className="bg-white dark:bg-gray-800 rounded-3xl border border-gray-200 dark:border-gray-700 shadow-xl p-6 md:p-8 mb-8 animate-in fade-in duration-300">
+                {/* Wizard Header */}
+                <div className="border-b border-gray-100 dark:border-gray-700 pb-5 mb-6">
+                  <div className="flex flex-wrap items-center justify-between gap-4">
+                    <div>
+                      <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-400 text-xs font-bold rounded-full mb-2 uppercase tracking-wide">
+                        Multipart PDF Wizard ⚡
+                      </span>
+                      <h2 className="text-xl md:text-2xl font-black text-gray-900 dark:text-gray-100 flex items-center gap-2">
+                        {chunkState.fileName}
+                      </h2>
+                      <p className="text-gray-500 dark:text-gray-400 text-sm mt-1">
+                        Total {chunkState.totalPageCount} pages • Processing Mode: <strong className="text-indigo-600 dark:text-indigo-400">{chunkState.mode === AppMode.STUDY_CARDS ? "Study Cards" : "Translation"}</strong>
+                      </p>
+                    </div>
+                    <button 
+                      onClick={() => setChunkState(prev => ({ ...prev, isActive: false }))} 
+                      className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 p-2"
+                      title="Cancel and close"
+                    >
+                      <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" /></svg>
+                    </button>
+                  </div>
+                </div>
 
-            {status === AppStatus.IDLE && appMode === AppMode.STUDY_CARDS && (
+                {/* Setup Configuration Panel */}
+                {chunkState.chunks.every(c => c.status === 'idle') && (
+                  <div className="bg-slate-50 dark:bg-gray-700/30 rounded-2xl p-5 border border-gray-100 dark:border-gray-700 mb-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
+                    <div>
+                      <h3 className="font-bold text-gray-800 dark:text-gray-200 text-sm">Configure Parts Size</h3>
+                      <p className="text-gray-500 dark:text-gray-400 text-xs mt-0.5">Select how many pages to process in each chunk. Smaller is safer for huge files.</p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {[1, 2, 3, 5, 10].map(size => (
+                        size <= chunkState.totalPageCount && (
+                          <button
+                            key={size}
+                            onClick={() => handlePageSizeChange(size)}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all border ${chunkState.pageSize === size ? 'bg-indigo-600 border-indigo-600 text-white shadow-sm' : 'bg-white dark:bg-gray-800 border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-50'}`}
+                          >
+                            {size} {size === 1 ? 'Page' : 'Pages'}
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Statistics / Status Bar */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
+                  <div className="bg-slate-50 dark:bg-gray-700/20 p-4 rounded-xl border border-gray-100 dark:border-gray-700">
+                    <span className="text-xs text-gray-400 dark:text-gray-500 uppercase tracking-wider block font-medium">Total Parts</span>
+                    <span className="text-xl font-black text-gray-800 dark:text-gray-100">{chunkState.chunks.length}</span>
+                  </div>
+                  <div className="bg-slate-50 dark:bg-gray-700/20 p-4 rounded-xl border border-gray-100 dark:border-gray-700">
+                    <span className="text-xs text-gray-400 dark:text-gray-500 uppercase tracking-wider block font-medium">Completed</span>
+                    <span className="text-xl font-black text-emerald-600 dark:text-emerald-400">
+                      {chunkState.chunks.filter(c => c.status === 'success').length} / {chunkState.chunks.length}
+                    </span>
+                  </div>
+                  <div className="bg-slate-50 dark:bg-gray-700/20 p-4 rounded-xl border border-gray-100 dark:border-gray-700">
+                    <span className="text-xs text-gray-400 dark:text-gray-500 uppercase tracking-wider block font-medium">Failed / Idle</span>
+                    <span className="text-xl font-black text-amber-600 dark:text-amber-500">
+                      {chunkState.chunks.filter(c => c.status === 'failed').length} / {chunkState.chunks.filter(c => c.status === 'idle').length}
+                    </span>
+                  </div>
+                  <div className="bg-slate-100 dark:bg-indigo-950/20 p-4 rounded-xl border border-indigo-100 dark:border-indigo-900/40">
+                    <span className="text-xs text-indigo-500 dark:text-indigo-400 uppercase tracking-wider block font-bold">Processed Items</span>
+                    <span className="text-xl font-black text-indigo-600 dark:text-indigo-400">
+                      {chunkState.mode === AppMode.STUDY_CARDS ? chunkState.accumulatedCards.length : chunkState.accumulatedTranslations.length}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Primary Action Controls */}
+                <div className="bg-slate-50 dark:bg-gray-700/25 border border-gray-100 dark:border-gray-700 rounded-2xl p-5 mb-6 flex flex-wrap gap-4 items-center justify-between">
+                  <div className="flex flex-wrap gap-3">
+                    {chunkState.isAutoProcessing ? (
+                      <button
+                        onClick={() => setChunkState(prev => ({ ...prev, isAutoProcessing: false }))}
+                        className="px-5 py-2.5 bg-amber-500 hover:bg-amber-600 text-white rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-colors"
+                      >
+                        <div className="w-2.5 h-2.5 bg-white rounded-full animate-ping"></div>
+                        Pause Auto-Pilot
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => setChunkState(prev => ({ ...prev, isAutoProcessing: true }))}
+                        className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-all hover:scale-[1.02] disabled:opacity-50"
+                        disabled={chunkState.chunks.every(c => c.status === 'success')}
+                      >
+                        <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" /></svg>
+                        Start Automatic (Auto-Pilot)
+                      </button>
+                    )}
+
+                    {!chunkState.isAutoProcessing && (
+                      <button
+                        onClick={() => {
+                          const nextIdx = chunkState.chunks.findIndex(c => c.status === 'idle' || c.status === 'failed');
+                          if (nextIdx !== -1) processChunk(nextIdx);
+                        }}
+                        disabled={chunkState.chunks.every(c => c.status === 'success') || status === AppStatus.PROCESSING_AI}
+                        className="px-5 py-2.5 bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-600 rounded-xl text-sm font-bold flex items-center gap-2 disabled:opacity-50 shadow-xs transition-colors"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 5l7 7-7 7M5 5l7 7-7 7" /></svg>
+                        Process Next Part
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="flex gap-2">
+                    {(chunkState.accumulatedCards.length > 0 || chunkState.accumulatedTranslations.length > 0) && (
+                      <button
+                        onClick={handleFinishChunkedProcessing}
+                        className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-sm font-bold flex items-center gap-2 shadow-sm transition-all hover:scale-[1.02]"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" /></svg>
+                        Finish & Save Extracted ({chunkState.mode === AppMode.STUDY_CARDS ? chunkState.accumulatedCards.length : chunkState.accumulatedTranslations.length} items)
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Chunk List Details */}
+                <h4 className="font-bold text-gray-700 dark:text-gray-300 text-sm mb-3">Parts Breakdown</h4>
+                <div className="space-y-3 max-h-[350px] overflow-y-auto custom-scrollbar pr-1 border border-gray-100 dark:border-gray-700 rounded-xl p-3">
+                  {chunkState.chunks.map((chunk, index) => {
+                    let statusBg = 'bg-gray-50 dark:bg-gray-800/40 border-gray-100 dark:border-gray-700';
+                    let statusBadge = <span className="text-gray-400 text-xs font-bold uppercase tracking-wider">Idle 💤</span>;
+                    
+                    if (chunk.status === 'processing') {
+                      statusBg = 'bg-indigo-50/50 dark:bg-indigo-900/10 border-indigo-200 animate-pulse';
+                      statusBadge = (
+                        <span className="text-indigo-600 dark:text-indigo-400 text-xs font-bold uppercase tracking-wider flex items-center gap-1.5">
+                          <div className="w-3.5 h-3.5 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+                          Processing ⚙️
+                        </span>
+                      );
+                    } else if (chunk.status === 'success') {
+                      statusBg = 'bg-emerald-50/20 dark:bg-emerald-950/10 border-emerald-100 dark:border-emerald-900/40';
+                      statusBadge = <span className="text-emerald-600 dark:text-emerald-400 text-xs font-bold uppercase tracking-wider">Success ✅</span>;
+                    } else if (chunk.status === 'failed') {
+                      statusBg = 'bg-red-50/20 dark:bg-red-950/10 border-red-100 dark:border-red-900/40';
+                      statusBadge = <span className="text-red-500 text-xs font-bold uppercase tracking-wider">Failed ❌</span>;
+                    }
+
+                    return (
+                      <div key={chunk.id} className={`p-4 rounded-xl border flex items-center justify-between gap-4 transition-all ${statusBg}`}>
+                        <div>
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="font-bold text-gray-800 dark:text-gray-200 text-sm md:text-base">Part {chunk.id}</span>
+                            {statusBadge}
+                          </div>
+                          <p className="text-gray-500 dark:text-gray-400 text-xs mt-0.5">Pages {chunk.startPage} to {chunk.endPage}</p>
+                          {chunk.error && <p className="text-red-500 text-xs font-medium mt-1 pr-4 truncate max-w-md">{chunk.error}</p>}
+                        </div>
+                        
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          {(chunk.status === 'idle' || chunk.status === 'failed') && (
+                            <button
+                              onClick={() => processChunk(index)}
+                              disabled={status === AppStatus.PROCESSING_AI}
+                              className="px-3 py-1.5 rounded-lg text-xs font-bold bg-white dark:bg-gray-700 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 border border-gray-200 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors disabled:opacity-50"
+                            >
+                              {chunk.status === 'failed' ? 'Retry' : 'Process This'}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Mobile Tab Selector */}
+            {!chunkState.isActive && (
+              <div className="md:hidden flex bg-gray-100 dark:bg-gray-800 p-1 rounded-lg mb-4">
+                <button 
+                  onClick={() => { setAppMode(AppMode.STUDY_CARDS); if(status !== AppStatus.PROCESSING_AI) setStatus(AppStatus.IDLE); }} 
+                  className={`flex-1 px-4 py-2 rounded-md text-sm font-medium transition-colors ${appMode === AppMode.STUDY_CARDS ? 'bg-white dark:bg-gray-700 shadow-sm text-indigo-600 dark:text-indigo-400' : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'}`}
+                >
+                  Cards
+                </button>
+                <button 
+                  onClick={() => { setAppMode(AppMode.TRANSLATION); if(status !== AppStatus.PROCESSING_AI) setStatus(AppStatus.IDLE); }} 
+                  className={`flex-1 px-4 py-2 rounded-md text-sm font-medium transition-colors ${appMode === AppMode.TRANSLATION ? 'bg-white dark:bg-gray-700 shadow-sm text-indigo-600 dark:text-indigo-400' : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'}`}
+                >
+                  Translate
+                </button>
+              </div>
+            )}
+
+            {!chunkState.isActive && status === AppStatus.IDLE && appMode === AppMode.STUDY_CARDS && (
               <div className="flex flex-col items-center justify-center h-[60vh] text-center text-gray-500 dark:text-gray-400">
                 <div className="w-24 h-24 bg-white dark:bg-gray-800 rounded-full flex items-center justify-center mb-6 shadow-sm border border-gray-100 dark:border-gray-700">
                   <svg className="w-10 h-10 text-indigo-300 dark:text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" /></svg>
@@ -553,7 +1100,7 @@ const App: React.FC = () => {
               </div>
             )}
 
-            {appMode === AppMode.TRANSLATION && (
+            {!chunkState.isActive && appMode === AppMode.TRANSLATION && (
               <div className="mb-8">
                 <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm p-6 mb-8">
                   <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">Translate Japanese Text</h2>
@@ -675,7 +1222,7 @@ const App: React.FC = () => {
               </div>
             )}
 
-            {(status === AppStatus.LOADING_PDF || status === AppStatus.PROCESSING_AI) && (
+            {!chunkState.isActive && (status === AppStatus.LOADING_PDF || status === AppStatus.PROCESSING_AI) && (
               <div className="flex flex-col items-center justify-center h-[60vh]">
                 <div className="w-16 h-16 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin mb-6"></div>
                 <h3 className="text-lg font-bold text-gray-800">Processing...</h3>
@@ -683,7 +1230,7 @@ const App: React.FC = () => {
               </div>
             )}
 
-            {status === AppStatus.ERROR && (
+            {!chunkState.isActive && status === AppStatus.ERROR && (
               <div className="bg-red-50 border border-red-100 rounded-2xl p-8 text-center max-w-md mx-auto mt-10">
                 <div className="text-red-500 mb-4 flex justify-center"><svg className="w-12 h-12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg></div>
                 <h3 className="text-lg font-bold text-red-800 mb-2">Something went wrong</h3>
@@ -692,7 +1239,7 @@ const App: React.FC = () => {
               </div>
             )}
 
-            {status === AppStatus.SUCCESS && appMode === AppMode.STUDY_CARDS && (
+            {!chunkState.isActive && status === AppStatus.SUCCESS && appMode === AppMode.STUDY_CARDS && (
               <div className="space-y-6 pb-20">
                 <div className="flex border-b border-gray-200 dark:border-gray-700 mb-6 no-print">
                   <button
